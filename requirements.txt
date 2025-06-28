@@ -2,3 +2,5 @@ Flask
 Flask-Cors
 requests
 waitress
+scikit-learn
+joblib
