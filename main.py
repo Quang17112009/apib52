@@ -5,33 +5,39 @@ import os
 import random
 import requests
 from flask import Flask, jsonify, request
+from apscheduler.schedulers.background import BackgroundScheduler # Import thư viện cho bộ lập lịch
 
-# --- Configure Logging ---
-# Set up logging to output messages to the console
+# --- Cấu hình Logging ---
+# Thiết lập logging để hiển thị thông báo ra console
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Configuration Class ---
+# --- Lớp cấu hình ứng dụng ---
 class AppConfig:
     """
-    Manages application-wide configurations, making them easily adjustable.
+    Quản lý các cấu hình toàn ứng dụng, giúp dễ dàng điều chỉnh.
     """
-    # CẬP NHẬT URL API BÊN NGOÀI ĐỂ LẤY DỮ LIỆU TỪ LINK MỚI
+    # Cập nhật URL API bên ngoài để lấy dữ liệu từ link mới
     EXTERNAL_API_URL: str = os.getenv("EXTERNAL_API_URL", "https://apib52.up.railway.app/api/taixiumd5")
-    HISTORY_MAX_LEN: int = 100  # Max number of sessions to keep in history
+    HISTORY_MAX_LEN: int = 100  # Số phiên tối đa lưu trong lịch sử
     DEFAULT_PATTERN_LENGTH: int = 8
 
-    # Prediction Strategy Thresholds
+    # Ngưỡng chiến lược dự đoán
     MIN_STREAK_FOR_PREDICTION: int = 3
     BREAK_STREAK_THRESHOLD: int = 5
     CONDITIONAL_PROB_LOOKBACK: int = 3
     PROB_THRESHOLD_STRONG: float = 0.60
-    REVERSE_THRESHOLD: int = 3 # Number of consecutive losses to trigger reversal
+    REVERSE_THRESHOLD: int = 3 # Số lần thua liên tiếp để kích hoạt đảo ngược
+
+    # CẤU HÌNH TẦN SUẤT KIỂM TRA TỰ ĐỘNG
+    # Tần suất (giây) API của bạn sẽ gọi API ngoài để cập nhật dữ liệu
+    # Đã thay đổi thành 5 giây
+    CHECK_INTERVAL_SECONDS: int = 5
 
 
-# --- Application State Class ---
+# --- Lớp trạng thái ứng dụng ---
 class AppState:
     """
-    Manages the global state of the application, including history and prediction info.
+    Quản lý trạng thái toàn cục của ứng dụng, bao gồm lịch sử và thông tin dự đoán.
     """
     def __init__(self):
         self.history_results: collections.deque = collections.deque(maxlen=AppConfig.HISTORY_MAX_LEN)
@@ -40,7 +46,7 @@ class AppState:
             "predicted_result": None,
             "consecutive_losses": 0,
             "last_actual_result": None,
-            # NEW: Prediction statistics
+            # MỚI: Thống kê dự đoán
             "total_predictions": 0,
             "correct_predictions": 0,
             "incorrect_predictions": 0
@@ -65,7 +71,7 @@ class AppState:
         }
 
     def reset_prediction_info(self):
-        """Resets consecutive losses and related prediction tracking, but not total stats."""
+        """Đặt lại số lần thua liên tiếp và theo dõi dự đoán liên quan, không phải tổng số thống kê."""
         self.last_prediction_info["predicted_expect"] = None
         self.last_prediction_info["predicted_result"] = None
         self.last_prediction_info["consecutive_losses"] = 0
@@ -73,49 +79,49 @@ class AppState:
 
 
     def update_last_prediction_info(self, predicted_expect: str, predicted_result: str):
-        """Updates the last prediction details for tracking."""
+        """Cập nhật chi tiết dự đoán cuối cùng để theo dõi."""
         self.last_prediction_info["predicted_expect"] = predicted_expect
         self.last_prediction_info["predicted_result"] = predicted_result
 
     def update_prediction_stats(self, processed_session_expect: str, actual_result_char: str):
         """
-        Updates the prediction statistics (total, correct, incorrect) and consecutive losses.
-        This function is called *after* a new session's actual result is known
-        and compares it against the *previous* prediction.
+        Cập nhật thống kê dự đoán (tổng, đúng, sai) và số lần thua liên tiếp.
+        Hàm này được gọi *sau khi* kết quả thực tế của một phiên mới được biết
+        và so sánh nó với dự đoán *trước đó*.
         """
         predicted_expect = self.last_prediction_info["predicted_expect"]
         predicted_result_str = self.last_prediction_info["predicted_result"]
 
-        # Only evaluate if there was a prediction made for this specific session
+        # Chỉ đánh giá nếu có dự đoán được đưa ra cho phiên cụ thể này
         if predicted_expect is not None and predicted_expect == processed_session_expect and predicted_result_str is not None:
             
             predicted_res_char = "t" if predicted_result_str == "Tài" else "x"
             
             self.last_prediction_info["total_predictions"] += 1
-            logging.debug(f"Evaluating prediction for session {processed_session_expect}. Predicted: {predicted_result_str} ({predicted_res_char}), Actual: {actual_result_char}")
+            logging.debug(f"Đang đánh giá dự đoán cho phiên {processed_session_expect}. Dự đoán: {predicted_result_str} ({predicted_res_char}), Thực tế: {actual_result_char}")
 
             if predicted_res_char != actual_result_char:
                 self.last_prediction_info["consecutive_losses"] += 1
                 self.last_prediction_info["incorrect_predictions"] += 1
-                logging.info(f"Prediction '{predicted_result_str}' for session Expect {processed_session_expect} MISSED. Consecutive losses: {self.last_prediction_info['consecutive_losses']}")
+                logging.info(f"Dự đoán '{predicted_result_str}' cho phiên Expect {processed_session_expect} TRẬT. Số lần thua liên tiếp: {self.last_prediction_info['consecutive_losses']}")
             else:
                 self.last_prediction_info["consecutive_losses"] = 0
                 self.last_prediction_info["correct_predictions"] += 1
-                logging.info(f"Prediction '{predicted_result_str}' for session Expect {processed_session_expect} CORRECT. Resetting losses.")
+                logging.info(f"Dự đoán '{predicted_result_str}' cho phiên Expect {processed_session_expect} ĐÚNG. Đặt lại số lần thua.")
         else:
-            # This handles cases where no prediction was made for the current incoming session,
-            # or it's the first run, or app restarted. Reset losses if no matching prediction.
+            # Xử lý các trường hợp không có dự đoán nào được đưa ra cho phiên hiện tại,
+            # hoặc đây là lần chạy đầu tiên, hoặc ứng dụng đã khởi động lại. Đặt lại số lần thua nếu không có dự đoán phù hợp.
             self.last_prediction_info["consecutive_losses"] = 0
-            logging.debug(f"No matching previous prediction for session {processed_session_expect} to evaluate. Resetting losses.")
+            logging.debug(f"Không có dự đoán phù hợp trước đó cho phiên {processed_session_expect} để đánh giá. Đặt lại số lần thua.")
         
         self.last_prediction_info["last_actual_result"] = actual_result_char
 
 
-# --- Helper Functions ---
+# --- Hàm trợ giúp ---
 def calculate_tai_xiu(open_code_str: str) -> tuple[str, int]:
     """
-    Calculates the sum of dice values and determines "Tài" (Over) or "Xỉu" (Under).
-    Returns a tuple of (result_type: str, total_sum: int).
+    Tính tổng giá trị xúc xắc và xác định "Tài" (Lớn) hoặc "Xỉu" (Nhỏ).
+    Trả về một tuple (loại kết quả: str, tổng: int).
     """
     try:
         dice_values = [int(x.strip()) for x in open_code_str.split(',')]
@@ -125,34 +131,34 @@ def calculate_tai_xiu(open_code_str: str) -> tuple[str, int]:
             return "Xỉu", total_sum
         elif 11 <= total_sum <= 17:
             return "Tài", total_sum
-        elif total_sum == 3: # Triple 1s - considered Xỉu
+        elif total_sum == 3: # Ba con 1 - được coi là Xỉu
             return "Xỉu", total_sum
-        elif total_sum == 18: # Triple 6s - considered Tài
+        elif total_sum == 18: # Ba con 6 - được coi là Tài
             return "Tài", total_sum
         else:
-            logging.warning(f"Unexpected sum for OpenCode '{open_code_str}': {total_sum}")
+            logging.warning(f"Tổng không mong muốn cho OpenCode '{open_code_str}': {total_sum}")
             return "Không xác định", total_sum
     except (ValueError, TypeError) as e:
-        logging.error(f"Error calculating Tai/Xiu from OpenCode '{open_code_str}': {e}")
+        logging.error(f"Lỗi khi tính Tài/Xỉu từ OpenCode '{open_code_str}': {e}")
         return "Lỗi", 0
 
 def get_next_expect_code(current_expect_code: str) -> str | None:
     """
-    Calculates the Expect code for the next session by incrementing the last 4 digits.
-    Assumes Expect code format 'YYYYMMDDXXXX' or just numbers.
+    Tính toán mã phiên tiếp theo bằng cách tăng 4 chữ số cuối.
+    Giả định định dạng mã phiên là 'YYYYMMDDXXXX' hoặc chỉ là số.
     """
-    # Xử lý trường hợp Expect code chỉ là số (ví dụ: '1450828')
+    # Xử lý trường hợp mã phiên chỉ là số (ví dụ: '1450828')
     if current_expect_code.isdigit():
         try:
             next_suffix_int = int(current_expect_code) + 1
             return str(next_suffix_int)
         except ValueError:
-            logging.error(f"Could not convert suffix '{current_expect_code}' to integer for incrementing.")
+            logging.error(f"Không thể chuyển đổi hậu tố '{current_expect_code}' thành số nguyên để tăng.")
             return None
     
     # Giữ lại logic cũ cho định dạng 'YYYYMMDDXXXX' nếu cần
     if len(current_expect_code) < 4 or not current_expect_code[-4:].isdigit():
-        logging.warning(f"Expect code '{current_expect_code}' does not match expected format for incrementing. Cannot calculate next expect code.")
+        logging.warning(f"Mã phiên '{current_expect_code}' không khớp định dạng mong muốn để tăng. Không thể tính toán mã phiên tiếp theo.")
         return None
 
     prefix = current_expect_code[:-4]
@@ -164,21 +170,21 @@ def get_next_expect_code(current_expect_code: str) -> str | None:
         next_suffix_str = str(next_suffix_int).zfill(len(suffix_str))
         return prefix + next_suffix_str
     except ValueError:
-        logging.error(f"Could not convert suffix '{suffix_str}' to integer for incrementing.")
+        logging.error(f"Không thể chuyển đổi hậu tố '{suffix_str}' thành số nguyên để tăng.")
         return None
 
-# --- Data Processor ---
+# --- Bộ xử lý dữ liệu ---
 class SessionDataProcessor:
     """
-    Handles processing of new session data from the external API and updates AppState.
+    Xử lý dữ liệu phiên mới từ API bên ngoài và cập nhật AppState.
     """
     def __init__(self, app_state: AppState):
         self.app_state = app_state
 
     def process_new_session(self, new_session_data: dict):
         """
-        Updates history and global state based on new session data.
-        CẬP NHẬT ĐỂ PHÙ HỢP VỚI ĐỊNH DẠNG DỮ LIỆU MỚI
+        Cập nhật lịch sử và trạng thái toàn cục dựa trên dữ liệu phiên mới.
+        Đã cập nhật để phù hợp với định dạng dữ liệu mới.
         """
         # Lấy dữ liệu từ định dạng JSON mới
         current_id = new_session_data.get('id', 'unknown_id') # Sử dụng 'id' từ JSON
@@ -199,7 +205,7 @@ class SessionDataProcessor:
         actual_result_type_from_api = new_session_data.get('Ket_qua', 'Không xác định')
         actual_result_char = "t" if "Tài" in actual_result_type_from_api else "x"
 
-        # Check if this session is already in history to avoid duplicates
+        # Kiểm tra xem phiên này đã có trong lịch sử để tránh trùng lặp
         # Sử dụng current_expect_code (tức là 'Phien') để kiểm tra tính duy nhất
         if not any(entry['Expect'] == current_expect_code for entry in self.app_state.history_results):
             self.app_state.history_results.append({
@@ -208,23 +214,23 @@ class SessionDataProcessor:
                 "OpenCode": current_open_code,
                 "Result": actual_result_char
             })
-            logging.info(f"Added new session to history: ID {current_id}, Expect {current_expect_code} - Result: {actual_result_type_from_api}")
+            logging.info(f"Đã thêm phiên mới vào lịch sử: ID {current_id}, Expect {current_expect_code} - Kết quả: {actual_result_type_from_api}")
             
-            # After adding a new session, update consecutive losses AND prediction stats
+            # Sau khi thêm một phiên mới, cập nhật số lần thua liên tiếp VÀ số liệu thống kê dự đoán
             self.app_state.update_prediction_stats(current_expect_code, actual_result_char)
         else:
-            logging.debug(f"Session Expect {current_expect_code} already in history. Skipping addition.")
+            logging.debug(f"Phiên Expect {current_expect_code} đã có trong lịch sử. Bỏ qua việc thêm vào.")
 
 
-        # Update core fields in the template
+        # Cập nhật các trường cốt lõi trong template
         self.app_state.initial_api_data_template["Phien_moi"] = current_expect_code
         
         next_expect_code = get_next_expect_code(current_expect_code)
         self.app_state.initial_api_data_template["phien_du_doan"] = next_expect_code if next_expect_code else "Không xác định"
 
-        # Update pattern and pattern percentages
+        # Cập nhật pattern và phần trăm pattern
         current_pattern_chars = "".join([entry['Result'] for entry in self.app_state.history_results])
-        # Ensure the pattern length doesn't exceed available history
+        # Đảm bảo độ dài pattern không vượt quá lịch sử có sẵn
         effective_pattern_length = min(AppConfig.DEFAULT_PATTERN_LENGTH, len(current_pattern_chars))
         self.app_state.initial_api_data_template['pattern'] = current_pattern_chars[-effective_pattern_length:]
         self.app_state.initial_api_data_template['pattern_length'] = effective_pattern_length
@@ -243,36 +249,36 @@ class SessionDataProcessor:
             self.app_state.initial_api_data_template['pattern_percent_tai'] = 0
             self.app_state.initial_api_data_template['pattern_percent_xiu'] = 0
 
-        # Update 'matches' (assuming it refers to the latest result)
+        # Cập nhật 'matches' (giả sử nó đề cập đến kết quả mới nhất)
         if self.app_state.history_results:
             self.app_state.initial_api_data_template['matches'] = [self.app_state.history_results[-1]['Result']]
         else:
             self.app_state.initial_api_data_template['matches'] = []
 
-        # Assume phan_tram_tai/xiu and tong_tai/xiu are derived from pattern_percent
+        # Giả sử phan_tram_tai/xiu và tong_tai/xiu được lấy từ pattern_percent
         self.app_state.initial_api_data_template['phan_tram_tai'] = self.app_state.initial_api_data_template['pattern_percent_tai']
         self.app_state.initial_api_data_template['phan_tram_xiu'] = self.app_state.initial_api_data_template['pattern_percent_xiu']
         
-        # Arbitrarily scale 'tong_tai' and 'tong_xiu' for the JSON output
+        # Tùy ý điều chỉnh 'tong_tai' và 'tong_xiu' cho đầu ra JSON
         self.app_state.initial_api_data_template['tong_tai'] = round(self.app_state.initial_api_data_template['phan_tram_tai'] * 10, 2)
         self.app_state.initial_api_data_template['tong_xiu'] = round(self.app_state.initial_api_data_template['phan_tram_xiu'] * 10, 2)
 
 
-# --- Prediction Strategy Class ---
+# --- Lớp chiến lược dự đoán ---
 class PredictionStrategy:
     """
-    Encapsulates the intelligent prediction logic.
-    Prioritizes prediction methods:
-    1. Loss-based reversal (override if consecutive losses hit threshold)
-    2. Conditional Probability (if strong signal)
-    3. Streak Analysis (if clear trend)
-    4. Default (based on overall pattern majority or random if balanced)
+    Đóng gói logic dự đoán thông minh.
+    Ưu tiên các phương pháp dự đoán:
+    1. Đảo ngược dựa trên thua (ghi đè nếu số lần thua liên tiếp đạt ngưỡng)
+    2. Xác suất có điều kiện (nếu tín hiệu mạnh)
+    3. Phân tích chuỗi (nếu xu hướng rõ ràng)
+    4. Mặc định (dựa trên đa số pattern tổng thể hoặc ngẫu nhiên nếu cân bằng)
     """
     def __init__(self, app_state: AppState):
         self.app_state = app_state
 
     def _analyze_streaks(self) -> tuple[int, str | None]:
-        """Analyzes the current streak length and type from history."""
+        """Phân tích độ dài và loại chuỗi hiện tại từ lịch sử."""
         if not self.app_state.history_results:
             return 0, None
 
@@ -292,9 +298,9 @@ class PredictionStrategy:
 
     def _calculate_conditional_probability(self, lookback_length: int) -> dict[str, dict[str, float]]:
         """
-        Calculates conditional probabilities of 't' or 'x' based on 'lookback_length'
-        previous results.
-        Returns: {'prefix': {'t': prob_t, 'x': prob_x}}
+        Tính toán xác suất có điều kiện của 't' hoặc 'x' dựa trên
+        các kết quả 'lookback_length' trước đó.
+        Trả về: {'tiền tố': {'t': prob_t, 'x': prob_x}}
         """
         if len(self.app_state.history_results) < lookback_length + 1:
             return {}
@@ -314,7 +320,7 @@ class PredictionStrategy:
         
         final_probs: dict[str, dict[str, float]] = {}
         for prefix, counts in probabilities.items():
-            total_count = float(counts['total']) # Ensure division is float
+            total_count = float(counts['total']) # Đảm bảo phép chia là số thực
             if total_count > 0:
                 final_probs[prefix] = {
                     't': float(counts['t']) / total_count,
@@ -327,29 +333,29 @@ class PredictionStrategy:
 
     def perform_prediction(self):
         """
-        Executes the intelligent prediction logic for the next session.
-        Updates 'du_doan' and 'ly_do' in the application state.
+        Thực hiện logic dự đoán thông minh cho phiên tiếp theo.
+        Cập nhật 'du_doan' và 'ly_do' trong trạng thái ứng dụng.
         """
         predicted_result: str = "Không có"
         prediction_reason: str = "Chưa có dữ liệu dự đoán."
 
-        # --- Strategy 1: Loss-based reversal ---
-        # This is the highest priority, overriding other predictions if active.
+        # --- Chiến lược 1: Đảo ngược dựa trên thua ---
+        # Đây là ưu tiên cao nhất, ghi đè các dự đoán khác nếu đang hoạt động.
         if self.app_state.last_prediction_info["consecutive_losses"] >= AppConfig.REVERSE_THRESHOLD:
-            # If we've been losing, reverse the last actual outcome if available, or just flip
+            # Nếu chúng ta đã thua, đảo ngược kết quả thực tế cuối cùng nếu có, hoặc chỉ đơn giản là lật
             last_actual = self.app_state.last_prediction_info["last_actual_result"]
             if last_actual == 't':
                 predicted_result = "Xỉu"
             elif last_actual == 'x':
                 predicted_result = "Tài"
-            else: # Fallback if no last actual result
+            else: # Dự phòng nếu không có kết quả thực tế cuối cùng
                 predicted_result = random.choice(["Tài", "Xỉu"])
             
             prediction_reason = f"Đang trật {self.app_state.last_prediction_info['consecutive_losses']} lần → Auto đảo ngược."
-            logging.info(f"Loss-based reversal activated: {prediction_reason}")
+            logging.info(f"Đã kích hoạt đảo ngược dựa trên thua: {prediction_reason}")
         
-        # --- Strategy 2: Conditional Probability ---
-        # Only consider if no loss-based reversal
+        # --- Chiến lược 2: Xác suất có điều kiện ---
+        # Chỉ xem xét nếu không có đảo ngược dựa trên thua
         if predicted_result == "Không có" or "Đang trật" not in prediction_reason:
             if len(self.app_state.history_results) >= AppConfig.CONDITIONAL_PROB_LOOKBACK:
                 recent_prefix_chars = "".join([entry['Result'] for entry in self.app_state.history_results])[-AppConfig.CONDITIONAL_PROB_LOOKBACK:]
@@ -363,45 +369,45 @@ class PredictionStrategy:
                         # Ghi đè dự đoán nếu xác suất có điều kiện mạnh hơn
                         predicted_result = "Tài"
                         prediction_reason = f"Xác suất Tài cao ({round(prob_t*100, 2)}%) sau '{recent_prefix_chars}'."
-                        logging.info(f"Conditional probability prediction: {prediction_reason}")
+                        logging.info(f"Dự đoán xác suất có điều kiện: {prediction_reason}")
                     elif prob_x > prob_t and prob_x >= AppConfig.PROB_THRESHOLD_STRONG:
                         # Ghi đè dự đoán nếu xác suất có điều kiện mạnh hơn
                         predicted_result = "Xỉu"
                         prediction_reason = f"Xác suất Xỉu cao ({round(prob_x*100, 2)}%) sau '{recent_prefix_chars}'."
-                        logging.info(f"Conditional probability prediction: {prediction_reason}")
+                        logging.info(f"Dự đoán xác suất có điều kiện: {prediction_reason}")
         
-        # --- Strategy 3: Streak Analysis ---
-        # Only consider if no loss-based reversal and no strong conditional probability
+        # --- Chiến lược 3: Phân tích chuỗi ---
+        # Chỉ xem xét nếu không có đảo ngược dựa trên thua và không có xác suất có điều kiện mạnh
         if predicted_result == "Không có" or ("Đang trật" not in prediction_reason and "Xác suất" not in prediction_reason):
             current_streak_length, current_streak_type = self._analyze_streaks()
 
             if current_streak_type:
                 if current_streak_length >= AppConfig.MIN_STREAK_FOR_PREDICTION:
                     if current_streak_length < AppConfig.BREAK_STREAK_THRESHOLD:
-                        # Follow the streak
+                        # Theo cầu
                         if current_streak_type == 't':
                             predicted_result = "Tài"
                             prediction_reason = f"Theo cầu Tài dài ({current_streak_length} lần)."
                         else:
                             predicted_result = "Xỉu"
                             prediction_reason = f"Theo cầu Xỉu dài ({current_streak_length} lần)."
-                        logging.info(f"Streak prediction: {prediction_reason}")
+                        logging.info(f"Dự đoán theo chuỗi: {prediction_reason}")
                     else:
-                        # Consider breaking the streak
+                        # Cân nhắc bẻ cầu
                         if current_streak_type == 't':
                             predicted_result = "Xỉu"
                             prediction_reason = f"Bẻ cầu Tài dài ({current_streak_length} lần) có khả năng đảo chiều."
                         else:
                             predicted_result = "Tài"
                             prediction_reason = f"Bẻ cầu Xỉu dài ({current_streak_length} lần) có khả năng đảo chiều."
-                        logging.info(f"Streak break prediction: {prediction_reason}")
+                        logging.info(f"Dự đoán bẻ cầu: {prediction_reason}")
                 else:
                     prediction_reason = "Không có cầu rõ ràng."
             else:
                 prediction_reason = "Chưa đủ dữ liệu để phân tích cầu."
 
-        # --- Strategy 4: Default Fallback ---
-        # If no strong signals from the above strategies
+        # --- Chiến lược 4: Dự phòng mặc định ---
+        # Nếu không có tín hiệu mạnh từ các chiến lược trên
         if predicted_result == "Không có" or ("Đang trật" not in prediction_reason and "Xác suất" not in prediction_reason and "cầu" not in prediction_reason):
             pattern_percent_tai = self.app_state.initial_api_data_template['pattern_percent_tai']
             pattern_percent_xiu = self.app_state.initial_api_data_template['pattern_percent_xiu']
@@ -415,102 +421,126 @@ class PredictionStrategy:
             else:
                 predicted_result = random.choice(["Tài", "Xỉu"])
                 prediction_reason = "Mặc định: Các tín hiệu cân bằng, dự đoán ngẫu nhiên."
-            logging.info(f"Default prediction: {prediction_reason}")
+            logging.info(f"Dự đoán mặc định: {prediction_reason}")
 
         self.app_state.initial_api_data_template['du_doan'] = predicted_result
         self.app_state.initial_api_data_template['ly_do'] = prediction_reason
 
-        # Save this prediction for evaluation in the next session
+        # Lưu dự đoán này để đánh giá trong phiên tiếp theo
         self.app_state.update_last_prediction_info(
             predicted_expect=self.app_state.initial_api_data_template["phien_du_doan"],
             predicted_result=predicted_result
         )
 
-# --- Flask Application Setup ---
+# --- Thiết lập ứng dụng Flask ---
 app = Flask(__name__)
 app_state = AppState()
 session_processor = SessionDataProcessor(app_state)
 prediction_strategy = PredictionStrategy(app_state)
 
+# Hàm sẽ được chạy bởi scheduler
+def scheduled_api_check():
+    logging.info("Tác vụ kiểm tra API tự động đã được kích hoạt.")
+    try:
+        response = requests.get(AppConfig.EXTERNAL_API_URL, timeout=10)
+        response.raise_for_status() # Ném lỗi nếu mã trạng thái là lỗi (4xx hoặc 5xx)
+        external_data = response.json()
+        logging.debug(f"Dữ liệu thô từ API bên ngoài (tự động): {external_data}")
+
+        new_session_data = external_data # Dữ liệu API mới nằm trực tiếp ở root
+        
+        # Kiểm tra xem dữ liệu có hợp lệ không trước khi xử lý (ví dụ: có trường 'Phien' và 'Ket_qua' không)
+        if new_session_data and new_session_data.get("Phien") is not None and new_session_data.get("Ket_qua") is not None:
+            session_processor.process_new_session(new_session_data)
+            prediction_strategy.perform_prediction()
+            logging.info(f"Cập nhật tự động thành công. Dự đoán hiện tại cho {app_state.initial_api_data_template['phien_du_doan']}: {app_state.initial_api_data_template['du_doan']}")
+        else:
+            logging.error(f"Kiểm tra tự động: Dữ liệu không hợp lệ hoặc thiếu 'Phien'/'Ket_qua' từ API bên ngoài. Phản hồi thô: {external_data}")
+    except requests.exceptions.Timeout:
+        logging.error(f"Kiểm tra tự động: Yêu cầu đến API bên ngoài đã hết thời gian chờ sau 10 giây.")
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Kiểm tra tự động: Không thể kết nối đến API bên ngoài: {e}.")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Kiểm tra tự động: Lỗi trong quá trình yêu cầu đến API bên ngoài: {e}.")
+    except Exception as e:
+        logging.exception(f"Kiểm tra tự động: Lỗi máy chủ nội bộ: {e}") # Ghi log toàn bộ traceback cho lỗi không mong muốn
+
+
 @app.route('/')
 def home():
-    """Home endpoint."""
+    """Điểm cuối trang chủ."""
     return "Chào mừng đến với API dự đoán Tài Xỉu trên Render! Truy cập /predict để xem dự đoán."
 
 @app.route('/predict', methods=['GET'])
 def get_prediction():
     """
-    Main endpoint to fetch the latest data from the external API,
-    update the state, and return the prediction for the next session.
+    Điểm cuối chính để lấy dữ liệu mới nhất từ API bên ngoài,
+    cập nhật trạng thái và trả về dự đoán cho phiên tiếp theo.
+    Hàm này vẫn có thể được gọi thủ công để kích hoạt cập nhật ngay lập tức.
     """
+    logging.info("Điểm cuối /predict thủ công đã được gọi.")
     try:
-        logging.info(f"Calling external API: {AppConfig.EXTERNAL_API_URL}")
-        response = requests.get(AppConfig.EXTERNAL_API_URL, timeout=10) # Added timeout
+        response = requests.get(AppConfig.EXTERNAL_API_URL, timeout=10) # Đã thêm timeout
         response.raise_for_status()
         external_data = response.json()
-        logging.debug(f"Raw data from external API: {external_data}")
+        logging.debug(f"Dữ liệu thô từ API bên ngoài (thủ công): {external_data}")
 
-        # Dữ liệu từ API mới có thể nằm trực tiếp ở root hoặc trong một trường con
-        # Dựa trên ví dụ bạn cung cấp, dữ liệu nằm trực tiếp ở root
-        # {"Ket_qua":"T\u00e0i","Phien":1450828,"Tong":11,"Xuc_xac_1":6,"Xuc_xac_2":3,"Xuc_xac_3":2,"id":"djtuancon"}
-        # Do đó, new_session_data chính là external_data
-        new_session_data = external_data 
+        new_session_data = external_data # Dữ liệu API mới nằm trực tiếp ở root
         
-        # Kiểm tra xem dữ liệu có vẻ hợp lệ không (ví dụ: có trường 'Phien' và 'Ket_qua' không)
         if new_session_data and new_session_data.get("Phien") is not None and new_session_data.get("Ket_qua") is not None:
             session_processor.process_new_session(new_session_data)
             prediction_strategy.perform_prediction()
 
             return jsonify(copy.deepcopy(app_state.initial_api_data_template)), 200
         else:
-            error_message = "Invalid data or missing 'Phien'/'Ket_qua' from external API."
-            logging.error(f"Error: {error_message} - Raw response: {external_data}")
+            error_message = "Dữ liệu không hợp lệ hoặc thiếu 'Phien'/'Ket_qua' từ API bên ngoài."
+            logging.error(f"Lỗi: {error_message} - Phản hồi thô: {external_data}")
             return jsonify({"error": error_message, "raw_response": external_data}), 500
 
     except requests.exceptions.Timeout:
-        error_message = f"Request to external API timed out after 10 seconds."
+        error_message = f"Yêu cầu đến API bên ngoài đã hết thời gian chờ sau 10 giây."
         logging.error(error_message)
         return jsonify({"error": error_message}), 504 # Gateway Timeout
     except requests.exceptions.ConnectionError as e:
-        error_message = f"Failed to connect to external API: {e}. Please check URL and network."
+        error_message = f"Không thể kết nối đến API bên ngoài: {e}. Vui lòng kiểm tra URL và mạng."
         logging.error(error_message)
         return jsonify({"error": error_message}), 503 # Service Unavailable
     except requests.exceptions.RequestException as e:
-        error_message = f"Error during request to external API: {e}."
+        error_message = f"Lỗi trong quá trình yêu cầu đến API bên ngoài: {e}."
         logging.error(error_message)
         return jsonify({"error": error_message}), 500
     except Exception as e:
-        error_message = f"Internal server error during prediction: {e}"
-        logging.exception(error_message) # Use exception for full traceback
+        error_message = f"Lỗi máy chủ nội bộ trong quá trình dự đoán: {e}"
+        logging.exception(error_message) # Sử dụng exception để in toàn bộ traceback
         return jsonify({"error": error_message}), 500
 
 @app.route('/status', methods=['GET'])
 def get_current_status():
     """
-    Endpoint to get the current prediction status without calling the external API.
+    Điểm cuối để lấy trạng thái dự đoán hiện tại mà không cần gọi API bên ngoài.
     """
     return jsonify(copy.deepcopy(app_state.initial_api_data_template)), 200
 
 @app.route('/history', methods=['GET'])
 def get_history():
     """
-    Endpoint to view the processed session history (in memory).
+    Điểm cuối để xem lịch sử phiên đã xử lý (trong bộ nhớ).
     """
     return jsonify(list(app_state.history_results)), 200
 
 @app.route('/last_prediction_info', methods=['GET'])
 def get_last_prediction_info_route():
     """
-    Endpoint to view information about the last prediction, consecutive losses,
-    and the new prediction statistics.
+    Điểm cuối để xem thông tin về dự đoán cuối cùng, số lần thua liên tiếp,
+    và thống kê dự đoán mới.
     """
     return jsonify(app_state.last_prediction_info), 200
 
 @app.route('/prediction_stats', methods=['GET'])
 def get_prediction_stats():
     """
-    NEW ENDPOINT: Returns the total number of predictions made,
-    and how many were correct vs. incorrect.
+    ĐIỂM CUỐI MỚI: Trả về tổng số dự đoán đã đưa ra,
+    và bao nhiêu dự đoán đúng so với sai.
     """
     stats = {
         "total_predictions": app_state.last_prediction_info["total_predictions"],
@@ -519,8 +549,16 @@ def get_prediction_stats():
     }
     return jsonify(stats), 200
 
-# --- Run the Flask Application ---
+# --- Chạy ứng dụng Flask ---
 if __name__ == '__main__':
+    # Khởi tạo và bắt đầu scheduler
+    scheduler = BackgroundScheduler()
+    # Thêm job để chạy hàm scheduled_api_check mỗi AppConfig.CHECK_INTERVAL_SECONDS
+    scheduler.add_job(func=scheduled_api_check, trigger="interval", seconds=AppConfig.CHECK_INTERVAL_SECONDS)
+    scheduler.start()
+    logging.info("Scheduler đã khởi động. Các tác vụ kiểm tra API tự động hiện đang hoạt động.")
+
     port = int(os.environ.get("PORT", 5000))
-    logging.info(f"Starting Flask app on port {port}")
-    app.run(debug=True, host='0.0.0.0', port=port)
+    logging.info(f"Đang khởi động ứng dụng Flask trên cổng {port}")
+    # Chạy ứng dụng Flask. use_reloader=False để tránh job chạy 2 lần trong debug mode
+    app.run(debug=True, host='0.0.0.0', port=port, use_reloader=False)
